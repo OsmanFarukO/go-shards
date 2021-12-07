@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/milvus-io/milvus-sdk-go/milvus"
+	uuid "github.com/nu7hatch/gouuid"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -34,11 +34,14 @@ type OperationRequest struct {
 	Id       int
 	Encoding []float32
 	Server   string
+	State    int // 1 -> active 0 -> passive
 }
 
 type SearchRequest struct {
-	Encoding []float32
+	Encoding [][]float32
 }
+
+var opts []clientv3.OpOption
 
 func getClient(configLocation string) (typev1.CoreV1Interface, error) {
 	kubeconfig := filepath.Clean(configLocation)
@@ -71,7 +74,7 @@ func searchMilvusSvcs(ctx context.Context) {
 		}
 	}
 
-	mockExternalList := []string{"10.4.4.3:19530", "10.4.4.4:19530"}
+	mockExternalList := []string{"10.5.5.3:19530", "10.5.5.4:19530"}
 
 	// this just mock service line
 	_, err = etcdClient.Put(ctx, "/avaliable_servers", strings.Join(mockExternalList, ","))
@@ -110,15 +113,8 @@ func getAvaliableServers(ctx context.Context) []string {
 }
 
 func deleteOperationKey(ctx context.Context, opkey string) {
-	// delete operation key here
-	_, err := etcdClient.Delete(ctx, opkey, clientv3.WithPrefix())
-	if err != nil {
-		fmt.Println("Cant delete ", opkey, " from etcd")
-	}
-	keyList := getOperationsKeyList(ctx)
-	newList := remove(keyList, opkey)
-	_, puterr := etcdClient.Put(ctx, "/operation_keys", strings.Join(newList, ","))
-	if puterr != nil {
+	_, delerr := etcdClient.Delete(ctx, opkey, clientv3.WithPrefix())
+	if delerr != nil {
 		fmt.Println("Cant delete ", opkey, " from etcd operation_keys")
 	}
 }
@@ -141,13 +137,14 @@ func insertToServers(ctx context.Context, operation OperationRequest, opKey stri
 	records[0].FloatData = operation.Encoding
 	insertParam := milvus.InsertParam{"encodings", "", records, []int64{int64(operation.Id)}}
 
-	id_array, status, err := milvusTmpClient.Insert(ctx, &insertParam)
+	_, status, err := milvusTmpClient.Insert(ctx, &insertParam)
 	if err != nil {
 		fmt.Println("Insert rpc failed: " + err.Error())
 	}
 	if !status.Ok() {
 		fmt.Println("Insert vector failed: " + status.GetMessage())
 	} else {
+		// fmt.Println("progress ", opKey, " is finished deleting...")
 		deleteOperationKey(ctx, opKey)
 	}
 }
@@ -169,26 +166,56 @@ func deleteFromServers(ctx context.Context, operation OperationRequest, opKey st
 }
 
 func updateToServers(ctx context.Context, operation OperationRequest, opKey string) {
-	// update encoding func
+	ipport := strings.Split(operation.Server, ":")
+	milvusTmpClient, err := milvus.NewMilvusClient(ctx, milvus.ConnectParam{IPAddress: ipport[0], Port: ipport[1]})
+	checkErr(err)
+	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, "encodings", "", []int64{int64(operation.Id)})
+	if deleteerr != nil {
+		fmt.Println("delete operation failed operation key is ", opKey)
+	}
+	if !status.Ok() {
+		fmt.Println("delete vector failed: " + status.GetMessage())
+	} else {
+		records := make([]milvus.Entity, 1)
+		records[0].FloatData = operation.Encoding
+		insertParam := milvus.InsertParam{"encodings", "", records, []int64{int64(operation.Id)}}
+		_, _, inserterr := milvusTmpClient.Insert(ctx, &insertParam)
+		if inserterr != nil {
+			fmt.Println("update operation failed operation key is ", opKey)
+		} else {
+			deleteOperationKey(ctx, opKey)
+		}
+	}
 }
 
 func checkEtcdOperations(ctx context.Context) {
 	operationsKL := getOperationsKeyList(ctx)
 	for i := 0; i < len(operationsKL); i++ {
 		operation := getOperationInfo(ctx, operationsKL[i])
-		if operation.Type == "i" {
-			insertToServers(ctx, operation, operationsKL[i])
-		} else if operation.Type == "d" {
-			deleteFromServers(ctx, operation, operationsKL[i])
-		} else if operation.Type == "u" {
-			updateToServers(ctx, operation, operationsKL[i])
+		if operation.State == 1 {
+			// fmt.Println("operation ", operationsKL[i], " in progress")
+		} else {
+			operation.State = 1
+			s, _ := json.Marshal(operation)
+			_, err := etcdClient.Put(ctx, operationsKL[i], string(s))
+			if err != nil {
+				fmt.Println("err")
+			} else {
+				if operation.Type == "i" {
+					go insertToServers(ctx, operation, operationsKL[i])
+				} else if operation.Type == "d" {
+					go deleteFromServers(ctx, operation, operationsKL[i])
+				} else if operation.Type == "u" {
+					go updateToServers(ctx, operation, operationsKL[i])
+				}
+			}
 		}
 	}
 	done <- true
 }
 
 func getOperationInfo(ctx context.Context, opkey string) OperationRequest {
-	operation, err := etcdClient.Get(ctx, "/"+opkey)
+	operation, err := etcdClient.Get(ctx, opkey)
 	checkErr(err)
 	var op OperationRequest
 	if len(operation.Kvs) > 0 {
@@ -200,24 +227,21 @@ func getOperationInfo(ctx context.Context, opkey string) OperationRequest {
 
 func checkNewOperations(ctx context.Context) {
 	for {
-		checkEtcdOperations(ctx)
+		go checkEtcdOperations(ctx)
 		time.Sleep(60 * time.Second)
 	}
 }
 
 func getOperationsKeyList(ctx context.Context) []string {
-	kl, err := etcdClient.Get(ctx, "/operation_keys")
+	kl, err := etcdClient.Get(ctx, "/operation_keys", opts...)
 	checkErr(err)
-	keyList := strings.Split(string(kl.Kvs[0].Value), ",")
+	keyList := []string{}
+	if len(kl.Kvs) != 0 {
+		for _, item := range kl.Kvs {
+			keyList = append(keyList, string(item.Key))
+		}
+	}
 	return keyList
-}
-
-func addKeyToOperationKeyList(ts string) {
-	ctx := context.Background()
-	opKeys := getOperationsKeyList(ctx)
-	opKeys = append(opKeys, ts)
-	_, err := etcdClient.Put(ctx, "/operation_keys", strings.Join(opKeys, ","))
-	checkErr(err)
 }
 
 func addOperationsHandler(w http.ResponseWriter, r *http.Request) {
@@ -232,13 +256,14 @@ func addOperationsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	avaliable_servers := getAvaliableServers(ctx)
+	var operationKey *uuid.UUID
 	if stringInSlice(operator.Type, []string{"i", "d", "u"}) {
 		for i := 0; i < len(avaliable_servers); i++ {
-			operationKey := strconv.FormatInt(time.Now().UTC().UnixNano(), 6)
-			addKeyToOperationKeyList(operationKey)
+			operationKey, _ = uuid.NewV4()
 			operator.Server = avaliable_servers[i]
+			operator.State = 0
 			s, _ := json.Marshal(operator)
-			_, err = etcdClient.Put(ctx, "/"+operationKey, string(s))
+			_, err = etcdClient.Put(ctx, "/operation_keys/"+operationKey.String(), string(s))
 			checkErr(err)
 		}
 		go checkEtcdOperations(ctx)
@@ -252,29 +277,27 @@ func searchEncoding(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	var searchop SearchRequest
 	var topkQueryResult milvus.TopkQueryResult
-	
+
 	err := json.NewDecoder(r.Body).Decode(&searchop)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	
+
 	extraParams := "{\"nprobe\" : 32}"
-	q := make([]milvus.Entity, 1)
-	q[0].FloatData = searchop.Encoding
-	
+	q := make([]milvus.Entity, len(searchop.Encoding))
+	for enc := 0; enc < len(searchop.Encoding); enc++ {
+		q[enc].FloatData = searchop.Encoding[enc]
+	}
+
 	searchParam := milvus.SearchParam{"encodings", q, 2, nil, extraParams}
 	topkQueryResult, _, err = milvusSearchClient.Search(ctx, searchParam)
 	if err != nil {
 		println("Search rpc failed: " + err.Error())
 	}
-	println("Search without index results: ")
 	fmt.Println("Search : ", topkQueryResult)
-	// for i := 0; i <= 1; i++ {
-	// 	print(topkQueryResult.QueryResultList[i].Ids[0])
-	// 	print("        ")
-	// 	println(topkQueryResult.QueryResultList[i].Distances[0])
-	// }
+	jsonresp, _ := json.Marshal(topkQueryResult)
+	w.Write(jsonresp)
 	w.WriteHeader(200)
 }
 
@@ -299,18 +322,19 @@ func main() {
 	ctx := context.Background()
 
 	etcdClient, _ = clientv3.New(clientv3.Config{
-		Endpoints:   []string{"10.4.4.2:2379"},
+		Endpoints:   []string{"10.5.5.2:2379"},
 		DialTimeout: 5 * time.Second,
 	})
+
+	opts = []clientv3.OpOption{
+		clientv3.WithPrefix(),
+	}
 
 	kubeconfig := filepath.Join(
 		getEnv("HOME", "~/"), ".kube", "config",
 	)
 
 	k8sClient, _ = getClient(kubeconfig)
-
-	// check if not key provided
-	_, _ = etcdClient.Put(ctx, "/operation_keys", "")
 
 	go startSearchingSvcs(ctx)
 	<-done

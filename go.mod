@@ -4,7 +4,6 @@ go 1.17
 
 require (
 	github.com/milvus-io/milvus-sdk-go v1.1.0
-	github.com/milvus-io/milvus-sdk-go/v2 v2.0.0-alpha.3
 	go.etcd.io/etcd/client/v3 v3.5.1
 	k8s.io/apimachinery v0.22.4
 	k8s.io/client-go v0.22.4
@@ -24,6 +23,7 @@ require (
 	github.com/json-iterator/go v1.1.11 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.1 // indirect
+	github.com/nu7hatch/gouuid v0.0.0-20131221200532-179d4d0c4d8d // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.1 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.1 // indirect
