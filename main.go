@@ -274,6 +274,7 @@ func addOperationsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func searchEncoding(w http.ResponseWriter, r *http.Request) {
+	// curl -X POST localhost:8080/search -H 'Content-Type: application/json' -d '{"Encoding":[[],[] ... ]}'
 	ctx := context.Background()
 	var searchop SearchRequest
 	var topkQueryResult milvus.TopkQueryResult
