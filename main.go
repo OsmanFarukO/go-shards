@@ -28,6 +28,7 @@ var milvusSearchClient milvus.MilvusClient
 var done = make(chan bool)
 var etcdClient *clientv3.Client
 var k8sClient typev1.CoreV1Interface
+var instance_collection string
 
 type OperationRequest struct {
 	Type     string
@@ -42,6 +43,34 @@ type SearchRequest struct {
 }
 
 var opts []clientv3.OpOption
+
+// helper funcs
+
+func remove(s []string, r string) []string {
+	for i, v := range s {
+		if v == r {
+			return append(s[:i], s[i+1:]...)
+		}
+	}
+	return s
+}
+
+func stringInSlice(a string, list []string) bool {
+	for _, b := range list {
+		if b == a {
+			return true
+		}
+	}
+	return false
+}
+
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if len(value) == 0 {
+		return defaultValue
+	}
+	return value
+}
 
 func getClient(configLocation string) (typev1.CoreV1Interface, error) {
 	kubeconfig := filepath.Clean(configLocation)
@@ -58,8 +87,8 @@ func getClient(configLocation string) (typev1.CoreV1Interface, error) {
 
 func searchMilvusSvcs(ctx context.Context) {
 	listOptions := metav1.ListOptions{}
-	namespace := getEnv("NAMESPACE", "")
-	svc_patt := getEnv("SVC_PATT", "")
+	namespace := getEnv("KUBE_NAMESPACE", "")
+	svc_patt := getEnv("KUBE_SVC_PATT", "")
 
 	svcs, err := k8sClient.Services(namespace).List(ctx, listOptions)
 	checkErr(err)
@@ -74,7 +103,7 @@ func searchMilvusSvcs(ctx context.Context) {
 		}
 	}
 
-	mockExternalList := []string{"10.5.5.3:19530", "10.5.5.4:19530"}
+	mockExternalList := []string{"10.4.4.3:19530", "10.4.4.4:19530"}
 
 	// this just mock service line
 	_, err = etcdClient.Put(ctx, "/avaliable_servers", strings.Join(mockExternalList, ","))
@@ -119,15 +148,6 @@ func deleteOperationKey(ctx context.Context, opkey string) {
 	}
 }
 
-func remove(s []string, r string) []string {
-	for i, v := range s {
-		if v == r {
-			return append(s[:i], s[i+1:]...)
-		}
-	}
-	return s
-}
-
 func insertToServers(ctx context.Context, operation OperationRequest, opKey string) {
 	ipport := strings.Split(operation.Server, ":")
 	milvusTmpClient, err := milvus.NewMilvusClient(ctx, milvus.ConnectParam{IPAddress: ipport[0], Port: ipport[1]})
@@ -135,7 +155,7 @@ func insertToServers(ctx context.Context, operation OperationRequest, opKey stri
 
 	records := make([]milvus.Entity, 1)
 	records[0].FloatData = operation.Encoding
-	insertParam := milvus.InsertParam{"encodings", "", records, []int64{int64(operation.Id)}}
+	insertParam := milvus.InsertParam{instance_collection, "", records, []int64{int64(operation.Id)}}
 
 	_, status, err := milvusTmpClient.Insert(ctx, &insertParam)
 	if err != nil {
@@ -153,7 +173,7 @@ func deleteFromServers(ctx context.Context, operation OperationRequest, opKey st
 	ipport := strings.Split(operation.Server, ":")
 	milvusTmpClient, err := milvus.NewMilvusClient(ctx, milvus.ConnectParam{IPAddress: ipport[0], Port: ipport[1]})
 	checkErr(err)
-	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, "encodings", "", []int64{int64(operation.Id)})
+	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, instance_collection, "", []int64{int64(operation.Id)})
 	if deleteerr != nil {
 		fmt.Println("delete operation failed operation key is ", opKey)
 	}
@@ -169,7 +189,7 @@ func updateToServers(ctx context.Context, operation OperationRequest, opKey stri
 	ipport := strings.Split(operation.Server, ":")
 	milvusTmpClient, err := milvus.NewMilvusClient(ctx, milvus.ConnectParam{IPAddress: ipport[0], Port: ipport[1]})
 	checkErr(err)
-	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, "encodings", "", []int64{int64(operation.Id)})
+	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, instance_collection, "", []int64{int64(operation.Id)})
 	if deleteerr != nil {
 		fmt.Println("delete operation failed operation key is ", opKey)
 	}
@@ -178,7 +198,7 @@ func updateToServers(ctx context.Context, operation OperationRequest, opKey stri
 	} else {
 		records := make([]milvus.Entity, 1)
 		records[0].FloatData = operation.Encoding
-		insertParam := milvus.InsertParam{"encodings", "", records, []int64{int64(operation.Id)}}
+		insertParam := milvus.InsertParam{instance_collection, "", records, []int64{int64(operation.Id)}}
 		_, _, inserterr := milvusTmpClient.Insert(ctx, &insertParam)
 		if inserterr != nil {
 			fmt.Println("update operation failed operation key is ", opKey)
@@ -285,13 +305,13 @@ func searchEncoding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	extraParams := "{\"nprobe\" : 32}"
+	extraParams := "{\"nprobe\" : " + getEnv("SEARCH_NPROBE", "32") + "}"
 	q := make([]milvus.Entity, len(searchop.Encoding))
 	for enc := 0; enc < len(searchop.Encoding); enc++ {
 		q[enc].FloatData = searchop.Encoding[enc]
 	}
 
-	searchParam := milvus.SearchParam{"encodings", q, 2, nil, extraParams}
+	searchParam := milvus.SearchParam{instance_collection, q, 2, nil, extraParams}
 	topkQueryResult, _, err = milvusSearchClient.Search(ctx, searchParam)
 	if err != nil {
 		println("Search rpc failed: " + err.Error())
@@ -302,28 +322,12 @@ func searchEncoding(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 }
 
-func stringInSlice(a string, list []string) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
-}
-
-func getEnv(key, defaultValue string) string {
-	value := os.Getenv(key)
-	if len(value) == 0 {
-		return defaultValue
-	}
-	return value
-}
-
 func main() {
 	ctx := context.Background()
 
 	etcdClient, _ = clientv3.New(clientv3.Config{
-		Endpoints:   []string{"10.5.5.2:2379"},
+		Endpoints:   []string{getEnv("ETCD_HOST", "10.4.4.2") + ":" + 
+							  getEnv("ETCD_PORT", "2379")}, // "10.4.4.2:2379"
 		DialTimeout: 5 * time.Second,
 	})
 
@@ -332,10 +336,12 @@ func main() {
 	}
 
 	kubeconfig := filepath.Join(
-		getEnv("HOME", "~/"), ".kube", "config",
+		getEnv("KUBE_DIR", "/home/osman"), ".kube", "config",
 	)
 
 	k8sClient, _ = getClient(kubeconfig)
+
+	instance_collection = getEnv("MILVUS_COLLECTION", "encodings")
 
 	go startSearchingSvcs(ctx)
 	<-done
