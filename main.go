@@ -336,7 +336,7 @@ func main() {
 	}
 
 	kubeconfig := filepath.Join(
-		getEnv("KUBE_DIR", "/home/osman"), ".kube", "config",
+		getEnv("KUBE_DIR", "/app"), "config",
 	)
 
 	k8sClient, _ = getClient(kubeconfig)

@@ -1,0 +1,50 @@
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: go-shard
+  namespace: default
+  labels:
+    app: go-shard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: go-shard
+  template:
+    metadata:
+      name: go-shard
+      labels:
+        app: go-shard
+    spec:
+      volumes:
+        - name: kubeconfig
+          configMap:
+            name: kubeconfig
+            defaultMode: 420
+      containers:
+        - name: go-shard
+          image: go-shard:1.0.0
+          ports:
+            - name: client
+              containerPort: 8080
+              protocol: TCP
+          resources: {}
+          volumeMounts:
+            - name: kubeconfig
+              mountPath: /app/config
+              subPath: config
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      schedulerName: default-scheduler
+  serviceName: go-shard
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  revisionHistoryLimit: 10

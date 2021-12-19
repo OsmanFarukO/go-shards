@@ -1,0 +1,22 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: go-shard
+  namespace: default
+spec:
+  ports:
+    - name: client
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+  selector:
+    app: go-shard
+  clusterIP: None
+  clusterIPs:
+    - None
+  type: ClusterIP
+  sessionAffinity: None
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  internalTrafficPolicy: Cluster
