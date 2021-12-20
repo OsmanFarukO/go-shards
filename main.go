@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
 	"github.com/milvus-io/milvus-sdk-go/milvus"
 	uuid "github.com/nu7hatch/gouuid"
 	clientv3 "go.etcd.io/etcd/client/v3"
