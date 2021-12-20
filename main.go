@@ -327,7 +327,7 @@ func main() {
 
 	etcdClient, _ = clientv3.New(clientv3.Config{
 		Endpoints:   []string{getEnv("ETCD_HOST", "10.4.4.2") + ":" + 
-							  getEnv("ETCD_PORT", "2379")}, // "10.4.4.2:2379"
+				      getEnv("ETCD_PORT", "2379")}, // "10.4.4.2:2379"
 		DialTimeout: 5 * time.Second,
 	})
 
