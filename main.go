@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
 	"github.com/milvus-io/milvus-sdk-go/milvus"
 	uuid "github.com/nu7hatch/gouuid"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -27,18 +28,21 @@ var milvusSearchClient milvus.MilvusClient
 var done = make(chan bool)
 var etcdClient *clientv3.Client
 var k8sClient typev1.CoreV1Interface
-var instance_collection string
 
 type OperationRequest struct {
 	Type     string
 	Id       int
 	Encoding []float32
+	Collection string
 	Server   string
 	State    int // 1 -> active 0 -> passive
 }
 
 type SearchRequest struct {
 	Encoding [][]float32
+	Collection string
+	TopK int
+	Nprobe int
 }
 
 var opts []clientv3.OpOption
@@ -154,7 +158,7 @@ func insertToServers(ctx context.Context, operation OperationRequest, opKey stri
 
 	records := make([]milvus.Entity, 1)
 	records[0].FloatData = operation.Encoding
-	insertParam := milvus.InsertParam{instance_collection, "", records, []int64{int64(operation.Id)}}
+	insertParam := milvus.InsertParam{operation.Collection, "", records, []int64{int64(operation.Id)}}
 
 	_, status, err := milvusTmpClient.Insert(ctx, &insertParam)
 	if err != nil {
@@ -172,7 +176,7 @@ func deleteFromServers(ctx context.Context, operation OperationRequest, opKey st
 	ipport := strings.Split(operation.Server, ":")
 	milvusTmpClient, err := milvus.NewMilvusClient(ctx, milvus.ConnectParam{IPAddress: ipport[0], Port: ipport[1]})
 	checkErr(err)
-	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, instance_collection, "", []int64{int64(operation.Id)})
+	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, operation.Collection, "", []int64{int64(operation.Id)})
 	if deleteerr != nil {
 		fmt.Println("delete operation failed operation key is ", opKey)
 	}
@@ -188,7 +192,7 @@ func updateToServers(ctx context.Context, operation OperationRequest, opKey stri
 	ipport := strings.Split(operation.Server, ":")
 	milvusTmpClient, err := milvus.NewMilvusClient(ctx, milvus.ConnectParam{IPAddress: ipport[0], Port: ipport[1]})
 	checkErr(err)
-	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, instance_collection, "", []int64{int64(operation.Id)})
+	status, deleteerr := milvusTmpClient.DeleteEntityByID(ctx, operation.Collection, "", []int64{int64(operation.Id)})
 	if deleteerr != nil {
 		fmt.Println("delete operation failed operation key is ", opKey)
 	}
@@ -197,7 +201,7 @@ func updateToServers(ctx context.Context, operation OperationRequest, opKey stri
 	} else {
 		records := make([]milvus.Entity, 1)
 		records[0].FloatData = operation.Encoding
-		insertParam := milvus.InsertParam{instance_collection, "", records, []int64{int64(operation.Id)}}
+		insertParam := milvus.InsertParam{operation.Collection, "", records, []int64{int64(operation.Id)}}
 		_, _, inserterr := milvusTmpClient.Insert(ctx, &insertParam)
 		if inserterr != nil {
 			fmt.Println("update operation failed operation key is ", opKey)
@@ -276,6 +280,17 @@ func addOperationsHandler(w http.ResponseWriter, r *http.Request) {
 
 	avaliable_servers := getAvaliableServers(ctx)
 	var operationKey *uuid.UUID
+
+	if r.Method == http.MethodDelete {
+		operator.Type = "d"
+	} else if r.Method == http.MethodPost {
+		operator.Type = "i"
+	} else if r.Method == http.MethodPut {
+		operator.Type = "u"
+	} else {
+		http.Error(w, "not supported request", http.StatusBadRequest)
+	}
+
 	if stringInSlice(operator.Type, []string{"i", "d", "u"}) {
 		for i := 0; i < len(avaliable_servers); i++ {
 			operationKey, _ = uuid.NewV4()
@@ -303,14 +318,41 @@ func searchEncoding(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	extraParams := "{\"nprobe\" : " + string(searchop.Nprobe) + "}"
 
-	extraParams := "{\"nprobe\" : " + getEnv("SEARCH_NPROBE", "32") + "}"
+	q := make([]milvus.Entity, 1)
+	q[0].FloatData = searchop.Encoding
+
+	searchParam := milvus.SearchParam{operation.Collection, q, searchop.TopK, nil, extraParams}
+	topkQueryResult, _, err = milvusSearchClient.Search(ctx, searchParam)
+	if err != nil {
+		println("Search rpc failed: " + err.Error())
+	}
+	fmt.Println("Search : ", topkQueryResult)
+	jsonresp, _ := json.Marshal(topkQueryResult)
+	w.Write(jsonresp)
+	w.WriteHeader(200)
+}
+
+func searchMultipleEncoding(w http.ResponseWriter, r *http.Request) {
+	// curl -X POST localhost:8080/search -H 'Content-Type: application/json' -d '{"Encoding":[[],[] ... ]}'
+	ctx := context.Background()
+	var searchop SearchRequest
+	var topkQueryResult milvus.TopkQueryResult
+
+	err := json.NewDecoder(r.Body).Decode(&searchop)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	extraParams := "{\"nprobe\" : " + string(searchop.Nprobe) + "}"
 	q := make([]milvus.Entity, len(searchop.Encoding))
 	for enc := 0; enc < len(searchop.Encoding); enc++ {
 		q[enc].FloatData = searchop.Encoding[enc]
 	}
 
-	searchParam := milvus.SearchParam{instance_collection, q, 2, nil, extraParams}
+	searchParam := milvus.SearchParam{operation.Collection, q, searchop.TopK, nil, extraParams}
 	topkQueryResult, _, err = milvusSearchClient.Search(ctx, searchParam)
 	if err != nil {
 		println("Search rpc failed: " + err.Error())
@@ -326,7 +368,7 @@ func main() {
 
 	etcdClient, _ = clientv3.New(clientv3.Config{
 		Endpoints:   []string{getEnv("ETCD_HOST", "10.4.4.2") + ":" + 
-				      getEnv("ETCD_PORT", "2379")}, // "10.4.4.2:2379"
+							  getEnv("ETCD_PORT", "2379")}, // "10.4.4.2:2379"
 		DialTimeout: 5 * time.Second,
 	})
 
@@ -349,8 +391,9 @@ func main() {
 	go checkNewOperations(ctx)
 	<-done
 
+	http.HandleFunc("/search-multiple", searchMultipleEncoding)
 	http.HandleFunc("/search", searchEncoding)
-	http.HandleFunc("/operations", addOperationsHandler)
+	http.HandleFunc("/", addOperationsHandler)
 	http.ListenAndServe(":8080", nil)
 }
 
